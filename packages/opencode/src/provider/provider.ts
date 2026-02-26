@@ -890,6 +890,96 @@ export namespace Provider {
       database[providerID] = parsed
     }
 
+    // auto-fetch models for openai-compatible providers with a configured baseURL
+    for (const [providerID, provider] of configProviders) {
+      const npm = provider.npm ?? "@ai-sdk/openai-compatible"
+      const baseURL = provider.options?.baseURL
+      if (npm !== "@ai-sdk/openai-compatible" || !baseURL) continue
+
+      const existing = database[providerID]
+      if (!existing) continue
+
+      const apiKey = provider.options?.apiKey
+      const headers: Record<string, string> = apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
+
+      await fetch(`${baseURL.replace(/\/+$/, "")}/models`, { headers, signal: AbortSignal.timeout(10_000) })
+        .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() })
+        .then((data: {
+          data?: {
+            id: string
+            context_length?: number
+            context_window?: number
+            max_completion_tokens?: number
+            max_output_tokens?: number
+            pricing?: { prompt?: number; completion?: number; cached_input?: number; cache_write?: number }
+            capabilities?: {
+              temperature?: boolean
+              reasoning?: boolean
+              attachments?: boolean
+              function_calling?: boolean
+              interleaved?: boolean
+              vision?: boolean
+            }
+            architecture?: { input_modalities?: string[]; output_modalities?: string[] }
+            family?: string
+            release_date?: string
+          }[]
+        }) => {
+          for (const model of data.data ?? []) {
+            if (!model.id || provider.models?.[model.id] || existing.models[model.id]) continue
+            const input = model.architecture?.input_modalities ?? []
+            const output = model.architecture?.output_modalities ?? []
+            const caps = model.capabilities ?? {}
+            const pricing = model.pricing ?? {}
+            const toM = (v?: number) => (v ?? 0) * 1_000_000
+            existing.models[model.id] = {
+              id: model.id,
+              name: model.id,
+              providerID,
+              api: { id: model.id, npm: "@ai-sdk/openai-compatible", url: baseURL },
+              status: "active" as const,
+              capabilities: {
+                temperature: caps.temperature ?? true,
+                reasoning: caps.reasoning ?? false,
+                attachment: caps.attachments ?? false,
+                toolcall: caps.function_calling ?? true,
+                input: {
+                  text: input.length === 0 || input.includes("text"),
+                  audio: input.includes("audio"),
+                  image: (caps.vision ?? false) || input.includes("image"),
+                  video: input.includes("video"),
+                  pdf: input.includes("pdf"),
+                },
+                output: {
+                  text: output.length === 0 || output.includes("text"),
+                  audio: output.includes("audio"),
+                  image: output.includes("image"),
+                  video: output.includes("video"),
+                  pdf: output.includes("pdf"),
+                },
+                interleaved: caps.interleaved ?? false,
+              },
+              cost: {
+                input: toM(pricing.prompt),
+                output: toM(pricing.completion),
+                cache: { read: toM(pricing.cached_input), write: toM(pricing.cache_write) },
+              },
+              options: {},
+              limit: {
+                context: model.context_length ?? model.context_window ?? 0,
+                output: model.max_completion_tokens ?? model.max_output_tokens ?? 0,
+              },
+              headers: {},
+              family: model.family ?? "",
+              release_date: model.release_date ?? "",
+              variants: {},
+            }
+          }
+          log.info("fetched models", { providerID, count: data.data?.length ?? 0 })
+        })
+        .catch((e) => log.warn("failed to fetch models", { providerID, error: e }))
+    }
+
     // load env
     const env = Env.all()
     for (const [providerID, provider] of Object.entries(database)) {
